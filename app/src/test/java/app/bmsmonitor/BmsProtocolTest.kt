@@ -16,15 +16,17 @@ class BmsProtocolTest {
         packet[4] = 0x6A // -150 / 100 = -1.50 A
         packet[5] = 73
         packet[6] = 95
+        packet[7] = 42
         packet[9] = 25
         packet[10] = 20
         packet[11] = 30
         packet[13] = 12
+        packet[14] = 0xA5.toByte()
         packet[15] = 0
-        packet[16] = 0xD2.toByte()
-        packet[17] = 0x04 // little-endian 1234 / 100
+        packet[16] = 0xD2.toByte() // Unmapped trailing bytes must not become capacity readings.
+        packet[17] = 0x04
         packet[18] = 0xB8.toByte()
-        packet[19] = 0x0B // little-endian 3000 / 100
+        packet[19] = 0x0B
 
         val status = BmsProtocol.parseStatus(packet)!!
         assertEquals("Diam", status.state)
@@ -32,9 +34,10 @@ class BmsProtocolTest {
         assertEquals(-1.5, status.current, 0.0001)
         assertEquals(73, status.soc)
         assertEquals(95, status.soh)
+        assertEquals(42, status.speed)
         assertEquals(12, status.cellCount)
-        assertEquals(12.34, status.remainingAh!!, 0.0001)
-        assertEquals(30.0, status.fullAh!!, 0.0001)
+        assertEquals(0xA5, status.bmsStatus)
+        assertEquals(BmsProtocol.parseStatus(packet.copyOf(16)), status)
     }
 
     @Test fun rejectsShortStatusPacket() {
@@ -42,8 +45,24 @@ class BmsProtocolTest {
     }
 
     @Test fun decodesCellsAndDropsEmptySentinelValues() {
-        val block = byteArrayOf(0x0C, 0xE4.toByte(), 0x0D, 0x48, 0, 0, 0xFF.toByte(), 0xFF.toByte())
+        val block = ByteArray(20)
+        block[0] = 0x0C
+        block[1] = 0xE4.toByte()
+        block[2] = 0x0D
+        block[3] = 0x48
+        block[6] = 0xFF.toByte()
+        block[7] = 0xFF.toByte()
         assertEquals(listOf(3.3, 3.4), BmsProtocol.parseCells(block))
+    }
+
+    @Test fun ignoresCellBlocksShorterThanTwentyBytesAndCapsLongBlocks() {
+        val partial = ByteArray(19).also { it[0] = 0x0C; it[1] = 0xE4.toByte() }
+        assertTrue(BmsProtocol.parseCells(partial).isEmpty())
+        val completeAndLong = ByteArray(22).also {
+            it[0] = 0x0C; it[1] = 0xE4.toByte()
+            it[20] = 0x0D; it[21] = 0x48
+        }
+        assertEquals(listOf(3.3), BmsProtocol.parseCells(completeAndLong))
     }
 
     @Test fun mapsFaultBitsAndReportsUnspecifiedBmsFault() {
@@ -57,10 +76,16 @@ class BmsProtocolTest {
         assertFalse(BmsProtocol.parseAlarms(null, null).isNotEmpty())
     }
 
-    @Test fun emitsReferenceMosCommandBytes() {
+    @Test fun emitsOnlyListedOriginalAppCommandPayloads() {
         assertEquals("11 01 0B", BmsProtocol.toHex(BmsProtocol.chargeMos(true)))
+        assertEquals("11 01 0A", BmsProtocol.toHex(BmsProtocol.chargeMos(false)))
+        assertEquals("12 01 0B", BmsProtocol.toHex(BmsProtocol.dischargeMos(true)))
         assertEquals("12 01 0A", BmsProtocol.toHex(BmsProtocol.dischargeMos(false)))
         assertEquals("13 01 0B", BmsProtocol.toHex(BmsProtocol.buzzer(true)))
+        assertEquals("13 01 0A", BmsProtocol.toHex(BmsProtocol.buzzer(false)))
+        assertEquals("12 01 0B", BmsProtocol.toHex(BmsProtocol.setPowerSwitch(true)))
+        assertEquals("12 01 0A", BmsProtocol.toHex(BmsProtocol.setPowerSwitch(false)))
+        assertEquals("10 01 0A", BmsProtocol.toHex(BmsProtocol.sleep()))
         assertEquals("FF FF FF", BmsProtocol.toHex(BmsProtocol.handshake.take(3).toByteArray()))
     }
 }

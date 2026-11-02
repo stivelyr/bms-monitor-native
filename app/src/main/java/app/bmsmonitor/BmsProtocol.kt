@@ -30,9 +30,7 @@ object BmsProtocol {
         val maxCellTemp: Int,
         val cellCount: Int,
         val bmsStatus: Int,
-        val hasFault: Boolean,
-        val remainingAh: Double?,
-        val fullAh: Double?
+        val hasFault: Boolean
     )
 
     data class Alarm(val code: String, val label: String)
@@ -69,11 +67,10 @@ object BmsProtocol {
         BitAlarm(6, 3, "Baterai terlepas")
     )
 
+    /** Only bytes 0–15 are mapped by the recovered status decoder; leave trailing bytes uninterpreted. */
     fun parseStatus(bytes: ByteArray?): Status? {
         if (bytes == null || bytes.size < 16) return null
         val stateIndex = u8(bytes[0])
-        val remaining = if (bytes.size >= 18) u16le(bytes, 16) / 100.0 else null
-        val full = if (bytes.size >= 20) u16le(bytes, 18) / 100.0 else null
         return Status(
             state = states.getOrNull(stateIndex) ?: "Tidak diketahui",
             voltage = u16be(bytes, 1) / 100.0,
@@ -86,16 +83,15 @@ object BmsProtocol {
             maxCellTemp = bytes[11].toInt(),
             cellCount = u8(bytes[13]),
             bmsStatus = u8(bytes[14]),
-            hasFault = u8(bytes[15]) == 1,
-            remainingAh = remaining,
-            fullAh = full
+            hasFault = u8(bytes[15]) == 1
         )
     }
 
     fun parseCells(vararg blocks: ByteArray?): List<Double> {
         val values = mutableListOf<Double>()
         blocks.forEach { block ->
-            if (block == null) return@forEach
+            // Ignore incomplete characteristic payloads instead of treating them as cell lists.
+            if (block == null || block.size < 20) return@forEach
             var offset = 0
             while (offset + 1 < block.size && offset < 20) {
                 val raw = u16be(block, offset)
@@ -130,21 +126,12 @@ object BmsProtocol {
         return Snapshot(status, cells, parseAlarms(faultA, faultB, status))
     }
 
+    /** Direct command payloads recovered from the original app; effects are not confirmed by BLE writes. */
     fun chargeMos(enabled: Boolean) = byteArrayOf(17, 1, if (enabled) 11 else 10)
     fun dischargeMos(enabled: Boolean) = byteArrayOf(18, 1, if (enabled) 11 else 10)
+    fun setPowerSwitch(enabled: Boolean) = byteArrayOf(18, 1, if (enabled) 11 else 10)
     fun buzzer(enabled: Boolean) = byteArrayOf(19, 1, if (enabled) 11 else 10)
     fun sleep() = byteArrayOf(16, 1, 10)
-
-    /** The reference PWA tries these in order and stops when the BLE write succeeds. */
-    fun powerOffCommands(): List<ByteArray> = listOf(
-        byteArrayOf(18, 1, 10), byteArrayOf(16, 1, 10), byteArrayOf(20, 1, 10),
-        byteArrayOf(21, 1, 10), byteArrayOf(22, 1, 10), byteArrayOf(17, 1, 10)
-    )
-
-    fun powerOnCommands(): List<ByteArray> = listOf(
-        byteArrayOf(18, 1, 11), byteArrayOf(20, 1, 11), byteArrayOf(21, 1, 11),
-        byteArrayOf(22, 1, 11), byteArrayOf(16, 1, 11)
-    )
 
     fun toHex(bytes: ByteArray): String = bytes.joinToString(" ") {
         String.format(Locale.US, "%02X", u8(it))
@@ -161,6 +148,5 @@ object BmsProtocol {
 
     private fun u8(value: Byte) = value.toInt() and 0xFF
     private fun u16be(bytes: ByteArray, offset: Int) = (u8(bytes[offset]) shl 8) or u8(bytes[offset + 1])
-    private fun u16le(bytes: ByteArray, offset: Int) = u8(bytes[offset]) or (u8(bytes[offset + 1]) shl 8)
     private fun s16be(bytes: ByteArray, offset: Int): Int = u16be(bytes, offset).let { if (it and 0x8000 != 0) it - 0x10000 else it }
 }

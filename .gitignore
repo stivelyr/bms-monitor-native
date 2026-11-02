@@ -10,3 +10,12 @@ local.properties
 # OS/editor noise
 .DS_Store
 Thumbs.db
+# BLE captures and uploaded diagnostic logs (keep outside version control)
+/ble-logs/
+/ble_logs/
+/logs/ble/
+*.btsnoop
+*.pcap
+*.pcapng
+*ble*log*.json
+*gatt*log*.json

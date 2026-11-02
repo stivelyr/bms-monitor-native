@@ -1,6 +1,7 @@
 package app.bmsmonitor
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
@@ -19,8 +20,11 @@ import android.bluetooth.le.ScanResult
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -28,8 +32,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -57,7 +63,9 @@ class MainActivity : Activity() {
     private val gattQueue = ArrayDeque<GattOperation>()
     private val scanDevices = LinkedHashMap<String, BluetoothDevice>()
     private val scanNames = LinkedHashMap<String, String>()
+    private val scanRssi = LinkedHashMap<String, Int>()
     private val logs = ArrayDeque<String>()
+    private val voltageHistory = ArrayDeque<ChartReading>()
     private val commandStates = mutableMapOf<String, Boolean?>(
         "charge" to null, "discharge" to null, "buzzer" to null
     )
@@ -73,6 +81,12 @@ class MainActivity : Activity() {
     private var operationTimeout: Runnable? = null
     private var scanCallback: ScanCallback? = null
     private var scanRunnable: Runnable? = null
+    private var pickerDialog: AlertDialog? = null
+    private var selectedDeviceAddress: String? = null
+    private var pickerResults: LinearLayout? = null
+    private var pickerStatus: TextView? = null
+    private var pickerProgress: ProgressBar? = null
+    private var pickerConnect: Button? = null
     private var deviceName = ""
     private var connection = Connection.IDLE
     private var snapshot: BmsProtocol.Snapshot? = null
@@ -86,12 +100,16 @@ class MainActivity : Activity() {
     private lateinit var refreshButton: Button
     private lateinit var disconnectButton: Button
     private lateinit var errorPanel: TextView
-    private lateinit var gauge: SocGauge
+    private lateinit var batteryBar: WaveBatteryBar
+    private lateinit var socValue: TextView
     private lateinit var heroVoltage: TextView
     private lateinit var heroCurrent: TextView
     private lateinit var heroState: TextView
     private lateinit var cellList: LinearLayout
-    private lateinit var cellSummary: TextView
+    private lateinit var cellSummary: LinearLayout
+    private lateinit var chartView: VoltageChartView
+    private lateinit var chartReadout: TextView
+    private lateinit var chartSummary: TextView
     private lateinit var temperatureRow: LinearLayout
     private lateinit var alarmList: LinearLayout
     private lateinit var alarmSummary: TextView
@@ -102,6 +120,7 @@ class MainActivity : Activity() {
 
     private enum class Connection { IDLE, SCANNING, CONNECTING, DISCOVERING, CONNECTED }
     private enum class OpKind { READ, WRITE, DESCRIPTOR, LOCAL }
+    private data class ChartReading(val atMillis: Long, val volts: Double)
     private data class GattOperation(
         val kind: OpKind,
         val uuid: String = "",
@@ -124,11 +143,13 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     override fun onDestroy() {
-        super.onDestroy()
         stopScan()
+        pickerDialog?.dismiss()
         handler.removeCallbacksAndMessages(null)
         try { gatt?.disconnect(); gatt?.close() } catch (_: Exception) { }
         gatt = null
+        voltageHistory.clear()
+        super.onDestroy()
     }
 
     private fun buildUi() {
@@ -174,28 +195,72 @@ class MainActivity : Activity() {
         page.addView(sectionHeader("Baterai"), marginParams(-1, -2, top = 22))
         val hero = card()
         val heroRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        gauge = SocGauge(this, accent, mutedColor)
-        heroRow.addView(gauge, LinearLayout.LayoutParams(dp(138), dp(138)))
-        val heroStats = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL }
+        val socBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL }
+        socValue = label("—%", 42f, textColor, true).apply { letterSpacing = -0.06f }
+        socBox.addView(socValue)
+        socBox.addView(label("STATE OF CHARGE", 9f, mutedColor, true), marginParams(-1, -2, top = 1))
+        heroRow.addView(socBox, LinearLayout.LayoutParams(0, -2, 1f))
+        heroState = label("—", 12f, mutedColor, false).apply {
+            setPadding(dp(10), dp(7), dp(10), dp(7)); background = rounded(cardSoft, borderColor, 40)
+        }
+        heroRow.addView(heroState)
+        hero.addView(heroRow)
+        batteryBar = WaveBatteryBar(this, accent)
+        hero.addView(batteryBar, marginParams(-1, dp(49), top = 10))
+        val heroStats = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val voltageBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val currentBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         heroVoltage = label("0.00 V", 29f, textColor, true)
         heroCurrent = label("0.00 A", 18f, accent, true).apply { typeface = Typeface.MONOSPACE }
-        heroState = label("—", 12f, mutedColor, false).apply {
-            setPadding(dp(10), dp(6), dp(10), dp(6)); background = rounded(cardSoft, borderColor, 40)
-        }
-        heroStats.addView(label("TEGANGAN PACK", 10f, mutedColor, true))
-        heroStats.addView(heroVoltage, marginParams(-1, -2, top = 4))
-        heroStats.addView(heroCurrent, marginParams(-1, -2, top = 7))
-        heroStats.addView(heroState, marginParams(-2, -2, top = 12))
-        heroRow.addView(heroStats, LinearLayout.LayoutParams(0, -2, 1f))
-        hero.addView(heroRow)
+        voltageBox.addView(label("TEGANGAN PACK", 9f, mutedColor, true))
+        voltageBox.addView(heroVoltage, marginParams(-1, -2, top = 3))
+        currentBox.addView(label("ARUS", 9f, mutedColor, true))
+        currentBox.addView(heroCurrent, marginParams(-1, -2, top = 3))
+        heroStats.addView(voltageBox, LinearLayout.LayoutParams(0, -2, 1f))
+        heroStats.addView(divider(), LinearLayout.LayoutParams(dp(1), dp(34)).apply { marginStart = dp(12); marginEnd = dp(12) })
+        heroStats.addView(currentBox, LinearLayout.LayoutParams(0, -2, 1f))
+        hero.addView(heroStats, marginParams(-1, -2, top = 13))
         page.addView(hero, marginParams(-1, -2, top = 10))
+
+        page.addView(sectionHeader("Riwayat tegangan"), marginParams(-1, -2, top = 22))
+        val chartCard = card()
+        val chartTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        chartTop.addView(label("Voltage pack", 13f, textColor, true), LinearLayout.LayoutParams(0, -2, 1f))
+        chartReadout = label("— V", 16f, accent, true).apply { typeface = Typeface.MONOSPACE; gravity = Gravity.END }
+        chartTop.addView(chartReadout)
+        chartCard.addView(chartTop)
+        chartSummary = label("Sambungkan BMS untuk mulai mengumpulkan bacaan sesi ini.", 10f, mutedColor, false)
+        chartCard.addView(chartSummary, marginParams(-1, -2, top = 4))
+        chartView = VoltageChartView(this, accent, mutedColor) { selected ->
+            if (selected == null) {
+                chartReadout.text = "— V"
+                chartSummary.text = "Sambungkan BMS untuk mulai mengumpulkan bacaan sesi ini."
+            } else {
+                chartReadout.text = String.format(Locale.US, "%.2f V", selected.volts)
+                chartSummary.text = "${SimpleDateFormat("dd/MM HH:mm:ss", Locale.US).format(Date(selected.atMillis))} · ${chartView.sampleCount()} bacaan sesi · geser untuk memeriksa"
+            }
+        }
+        chartCard.addView(chartView, marginParams(-1, dp(150), top = 7))
+        val rangeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        listOf("24 jam" to 24, "7 hari" to 168, "30 hari" to 720).forEach { (caption, hours) ->
+            val rangeButton = actionButton(caption, filled = false).apply {
+                setOnClickListener {
+                    chartView.setRangeHours(hours)
+                }
+            }
+            rangeRow.addView(rangeButton, LinearLayout.LayoutParams(0, dp(37), 1f).apply { if (hours != 24) marginStart = dp(7) })
+        }
+        chartCard.addView(rangeRow, marginParams(-1, -2, top = 8))
+        chartCard.addView(label("Grafik memakai data nyata dari sesi ini saja; riwayat tidak disimpan ke perangkat atau server.", 10f, mutedColor, false), marginParams(-1, -2, top = 8))
+        page.addView(chartCard, marginParams(-1, -2, top = 10))
 
         page.addView(sectionHeader("Ringkasan"), marginParams(-1, -2, top = 22))
         val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val statRows = listOf(
             listOf("soh" to "Kesehatan", "cells" to "Jumlah sel"),
             listOf("remaining" to "Kapasitas sisa", "full" to "Kapasitas penuh"),
-            listOf("minTemp" to "Suhu sel min", "maxTemp" to "Suhu sel maks")
+            listOf("minTemp" to "Suhu sel min", "maxTemp" to "Suhu sel maks"),
+            listOf("speed" to "Kecepatan · raw", "bmsStatus" to "Status BMS · raw")
         )
         statRows.forEachIndexed { index, pair ->
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -206,10 +271,11 @@ class MainActivity : Activity() {
             grid.addView(row, marginParams(-1, -2, top = if (index == 0) 0 else 9))
         }
         page.addView(grid, marginParams(-1, -2, top = 10))
+        page.addView(label("Kapasitas tidak ditampilkan karena field kapasitas belum terverifikasi dalam protokol.", 11f, mutedColor, false), marginParams(-1, -2, top = 6))
 
         page.addView(sectionHeader("Tegangan sel"), marginParams(-1, -2, top = 22))
         val cellsCard = card()
-        cellSummary = label("▲ sel tertinggi · ▼ sel terendah · ! >100 mV dari rata-rata", 11f, mutedColor, false)
+        cellSummary = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         cellsCard.addView(cellSummary)
         cellList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         cellsCard.addView(cellList, marginParams(-1, -2, top = 10))
@@ -230,23 +296,34 @@ class MainActivity : Activity() {
         controls.addView(switchRow("Buzzer", "Nyalakan penanda suara pada baterai", "buzzer"))
         val powerRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val powerOff = actionButton("Matikan baterai", filled = false, destructive = true).apply {
-            setOnClickListener { confirmPowerAction("Matikan baterai?", "Perintah ini dapat memutus semua beban yang tersambung ke keluaran baterai. Pastikan beban aman untuk dimatikan.") { performPowerSequence(false) } }
+            setOnClickListener {
+                val payload = BmsProtocol.setPowerSwitch(false)
+                confirmPowerAction("Matikan baterai?", "Perintah SetPowerSwitch dapat memutus daya ke beban yang tersambung. Pastikan beban aman untuk dimatikan.", payload) {
+                    sendDirectCommand("SetPowerSwitch OFF", payload)
+                }
+            }
         }
         val powerOn = actionButton("Nyalakan baterai", filled = false).apply {
-            setOnClickListener { confirmPowerAction("Nyalakan baterai?", "Perintah akan dikirim ke BMS. Status aktual baterai tidak dapat dikonfirmasi lewat respons tulis BLE.") { performPowerSequence(true) } }
+            setOnClickListener {
+                val payload = BmsProtocol.setPowerSwitch(true)
+                confirmPowerAction("Nyalakan baterai?", "Perintah SetPowerSwitch akan dikirim. Status fisik tidak dapat dikonfirmasi melalui hasil tulis BLE.", payload) {
+                    sendDirectCommand("SetPowerSwitch ON", payload)
+                }
+            }
         }
         powerRow.addView(powerOff, LinearLayout.LayoutParams(0, dp(48), 1f))
         powerRow.addView(powerOn, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(9) })
         controls.addView(powerRow, marginParams(-1, -2, top = 14))
         val sleepButton = actionButton("Mode tidur", filled = false).apply {
-            setOnClickListener { confirmPowerAction("Masuk mode tidur?", "Mode tidur dapat mengubah perilaku baterai dan memutus keluaran.") { sendDirectCommand("Mode tidur", BmsProtocol.sleep()) } }
+            setOnClickListener {
+                val payload = BmsProtocol.sleep()
+                confirmPowerAction("Masuk mode tidur?", "Mode tidur dapat mengubah perilaku baterai dan memutus keluaran.", payload) {
+                    sendDirectCommand("Mode tidur", payload)
+                }
+            }
         }
         controls.addView(sleepButton, marginParams(-1, dp(46), top = 9))
-        val cutButton = actionButton("Putuskan semua keluaran", filled = false, destructive = true).apply {
-            setOnClickListener { confirmPowerAction("Putuskan semua keluaran?", "MOS pengosongan (dan, bila perintah pertama gagal, pengisian) akan dimatikan. Motor, lampu, GPS, dan beban lain pada keluaran baterai dapat mati.") { cutAllOutputs() } }
-        }
-        controls.addView(cutButton, marginParams(-1, dp(46), top = 9))
-        val safety = label("Perangkat yang disambung langsung ke sel baterai—misalnya pelacak GPS anti-maling—dapat tetap menyala. Status sakelar di aplikasi menunjukkan perintah terakhir, bukan keadaan MOS yang dibaca balik.", 11f, warn, false)
+        val safety = label("Kontrol memakai payload tetap dari pemetaan original app. Mematikan pengosongan dapat menghentikan motor, lampu, GPS, dan beban lain; perangkat yang tersambung langsung ke sel mungkin tetap menyala. Status menunjukkan hasil tulis BLE, bukan keadaan baterai yang dibaca balik.", 11f, warn, false)
         safety.setPadding(dp(10), dp(10), dp(10), dp(10))
         safety.background = rounded(0x22271A0C, 0x664B3B24, 10)
         controls.addView(safety, marginParams(-1, -2, top = 12))
@@ -256,7 +333,7 @@ class MainActivity : Activity() {
 
         page.addView(sectionHeader("Diagnostik GATT"), marginParams(-1, -2, top = 22))
         val diagnostic = card()
-        diagnostic.addView(label("Daftar layanan dan karakteristik BLE yang ditemukan. Uji opcode otomatis dan pengiriman byte bebas tidak disertakan agar tidak mengirim perintah daya yang belum diverifikasi.", 12f, mutedColor, false))
+        diagnostic.addView(label("Daftar layanan dan karakteristik BLE yang ditemukan. Tidak ada uji opcode otomatis atau rangkaian fallback; kontrol hanya mengirim payload langsung yang ditampilkan pada konfirmasi.", 12f, mutedColor, false))
         val scanGattButton = actionButton("Pindai GATT", filled = false).apply { setOnClickListener { scanGattServices() } }
         diagnostic.addView(scanGattButton, marginParams(-1, dp(44), top = 12))
         page.addView(diagnostic, marginParams(-1, -2, top = 10))
@@ -319,13 +396,22 @@ class MainActivity : Activity() {
                 toast("Hubungkan baterai terlebih dahulu")
                 return@setOnCheckedChangeListener
             }
-            if (key == "charge") {
-                confirmPowerAction(if (checked) "Izinkan pengisian?" else "Hentikan pengisian?", "Perintah akan mengubah MOS pengisian. Keadaan aktual tidak dibaca balik oleh BMS.") { sendMos(key, checked) }
-            } else if (key == "discharge") {
-                confirmPowerAction(if (checked) "Izinkan pengosongan?" else "Putuskan MOS pengosongan?", if (checked) "Baterai akan diizinkan memberi daya ke beban." else "Ini dapat memutus daya ke semua beban pada keluaran baterai, termasuk motor, lampu, dan GPS.") { sendMos(key, checked) }
-            } else {
-                sendMos(key, checked)
+            val bytes = when (key) {
+                "charge" -> BmsProtocol.chargeMos(checked)
+                "discharge" -> BmsProtocol.dischargeMos(checked)
+                else -> BmsProtocol.buzzer(checked)
             }
+            val dialogTitle = when (key) {
+                "charge" -> if (checked) "Izinkan pengisian?" else "Hentikan pengisian?"
+                "discharge" -> if (checked) "Izinkan pengosongan?" else "Putuskan MOS pengosongan?"
+                else -> if (checked) "Nyalakan buzzer?" else "Matikan buzzer?"
+            }
+            val warning = when (key) {
+                "charge" -> "Perintah akan mengubah MOS pengisian. Keadaan aktual tidak dibaca balik oleh BMS."
+                "discharge" -> if (checked) "Baterai akan diizinkan memberi daya ke beban." else "Ini dapat memutus daya ke semua beban pada keluaran baterai, termasuk motor, lampu, dan GPS."
+                else -> "Perintah buzzer akan dikirim; efek fisik tidak dikonfirmasi melalui hasil tulis BLE."
+            }
+            confirmPowerAction(dialogTitle, warning, bytes) { sendMos(key, checked) }
         }
         return row
     }
@@ -399,11 +485,18 @@ class MainActivity : Activity() {
     private fun beginScan() {
         val adapter = bluetoothAdapter ?: return
         if (!hasBlePermissions()) { requestBlePermissions(); return }
+        if (pickerDialog?.isShowing != true) showDevicePicker()
+        stopScan()
         scanDevices.clear()
         scanNames.clear()
+        scanRssi.clear()
+        selectedDeviceAddress = null
         setError(null)
         connection = Connection.SCANNING
         renderConnection()
+        pickerStatus?.text = "Memindai perangkat BMS di sekitar…"
+        pickerProgress?.visibility = View.VISIBLE
+        renderPickerDevices()
         try {
             scanner = adapter.bluetoothLeScanner
             val bleScanner = scanner ?: throw IllegalStateException("Pemindai BLE tidak tersedia")
@@ -411,21 +504,43 @@ class MainActivity : Activity() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) = collectScanResult(result)
                 override fun onBatchScanResults(results: MutableList<ScanResult>) { results.forEach { collectScanResult(it) } }
                 override fun onScanFailed(errorCode: Int) {
-                    runOnUiThread { setError("Pemindaian BLE gagal (kode $errorCode).") }
+                    runOnUiThread {
+                        stopScan()
+                        connection = Connection.IDLE
+                        renderConnection()
+                        pickerProgress?.visibility = View.GONE
+                        pickerStatus?.text = "Pemindaian gagal (kode $errorCode). Coba lagi."
+                        setError("Pemindaian BLE gagal (kode $errorCode).")
+                    }
                 }
             }
             scanCallback = cb
             bleScanner.startScan(cb)
             addLog("Memindai perangkat BTD / layanan BMS selama 8 detik")
-            val stop = Runnable { stopScan(); chooseDevice() }
+            val stop = Runnable {
+                stopScan()
+                if (connection == Connection.SCANNING) {
+                    connection = Connection.IDLE
+                    renderConnection()
+                    pickerProgress?.visibility = View.GONE
+                    pickerStatus?.text = if (scanDevices.isEmpty()) "Tidak ada perangkat cocok. Pastikan baterai menyala, lalu pindai lagi." else "${scanDevices.size} perangkat cocok ditemukan. Pilih baterai untuk melanjutkan."
+                    renderPickerDevices()
+                }
+            }
             scanRunnable = stop
             handler.postDelayed(stop, 8_000)
         } catch (e: SecurityException) {
+            stopScan()
             connection = Connection.IDLE
             setError("Izin Bluetooth tidak tersedia: ${e.message}")
+            pickerProgress?.visibility = View.GONE
+            pickerStatus?.text = "Izin Bluetooth diperlukan untuk memindai."
         } catch (e: Exception) {
+            stopScan()
             connection = Connection.IDLE
             setError("Tidak dapat memindai BLE: ${e.message}")
+            pickerProgress?.visibility = View.GONE
+            pickerStatus?.text = "Pemindaian tidak dapat dimulai. Coba lagi."
         }
     }
 
@@ -440,7 +555,9 @@ class MainActivity : Activity() {
             val address = result.device.address
             runOnUiThread {
                 scanDevices[address] = result.device
-                scanNames[address] = "$name  ·  $address"
+                scanNames[address] = name
+                scanRssi[address] = result.rssi
+                renderPickerDevices()
             }
         } catch (_: SecurityException) { }
     }
@@ -456,21 +573,105 @@ class MainActivity : Activity() {
         scanCallback = null
     }
 
-    private fun chooseDevice() {
-        if (connection != Connection.SCANNING) return
-        connection = Connection.IDLE
-        renderConnection()
-        val devices = scanDevices.values.toList()
-        if (devices.isEmpty()) {
-            setError("Tidak ditemukan baterai yang cocok. Pastikan BMS BLE menyala dan mengiklankan nama BTD atau layanan 0x8900.")
-            return
+    private fun showDevicePicker() {
+        if (pickerDialog?.isShowing == true) return
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(16))
+            background = rounded(cardColor, borderColor, 22)
         }
-        val names = devices.map { scanNames[it.address] ?: it.address }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Pilih baterai")
-            .setItems(names) { _, which -> devices.getOrNull(which)?.let { connectToDevice(it) } }
-            .setNegativeButton("Batal", null)
-            .show()
+        val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titleBox.addView(label("Pilih baterai", 22f, textColor, true))
+        titleBox.addView(label("Perangkat ditampilkan dari hasil scan BLE aktual.", 11f, mutedColor, false), marginParams(-1, -2, top = 4))
+        titleRow.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f))
+        titleRow.addView(actionButton("Tutup", filled = false).apply {
+            setOnClickListener { pickerDialog?.dismiss() }
+        })
+        root.addView(titleRow)
+        pickerStatus = label("Menyiapkan pemindaian…", 12f, mutedColor, false)
+        root.addView(pickerStatus, marginParams(-1, -2, top = 12))
+        pickerProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+        }
+        root.addView(pickerProgress, marginParams(-1, dp(4), top = 8))
+        val listScroll = ScrollView(this).apply { overScrollMode = View.OVER_SCROLL_NEVER }
+        pickerResults = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        listScroll.addView(pickerResults, ViewGroup.LayoutParams(-1, -2))
+        root.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(12); bottomMargin = dp(10) })
+        val footer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        footer.addView(actionButton("Pindai lagi", filled = false).apply { setOnClickListener { beginScan() } }, LinearLayout.LayoutParams(0, dp(46), 1f))
+        pickerConnect = actionButton("Hubungkan", filled = true).apply {
+            isEnabled = false
+            setOnClickListener {
+                val device = selectedDeviceAddress?.let { scanDevices[it] }
+                if (device == null) {
+                    toast("Pilih perangkat dari hasil scan terlebih dahulu")
+                } else {
+                    pickerDialog?.dismiss()
+                    connectToDevice(device)
+                }
+            }
+        }
+        footer.addView(pickerConnect, LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginStart = dp(8) })
+        root.addView(footer)
+        val dialog = AlertDialog.Builder(this).setView(root).setCancelable(true).create()
+        pickerDialog = dialog
+        dialog.setOnDismissListener {
+            if (connection == Connection.SCANNING) {
+                stopScan()
+                connection = Connection.IDLE
+                renderConnection()
+            }
+            pickerDialog = null
+            pickerResults = null
+            pickerStatus = null
+            pickerProgress = null
+            pickerConnect = null
+        }
+        dialog.show()
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        renderPickerDevices()
+    }
+
+    private fun renderPickerDevices() {
+        val list = pickerResults ?: return
+        list.removeAllViews()
+        val ordered = scanDevices.keys.sortedByDescending { scanRssi[it] ?: -127 }
+        if (ordered.isEmpty()) {
+            list.addView(label("Perangkat BTD atau layanan BMS 0x8900 yang cocok akan muncul di sini.", 12f, mutedColor, false).apply {
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(32), dp(12), dp(32))
+            })
+        }
+        ordered.forEach { address ->
+            val selected = selectedDeviceAddress == address
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(11), dp(12), dp(11))
+                background = rounded(if (selected) 0xFF1D3026.toInt() else cardSoft, if (selected) accent else borderColor, 14)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    selectedDeviceAddress = address
+                    renderPickerDevices()
+                }
+            }
+            val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            info.addView(label(scanNames[address] ?: "BMS BLE", 14f, textColor, true))
+            info.addView(label(address, 10f, mutedColor, false).apply { typeface = Typeface.MONOSPACE }, marginParams(-1, -2, top = 4))
+            info.addView(label("BLE · RSSI ${scanRssi[address] ?: "—"} dBm", 10f, accent, false), marginParams(-1, -2, top = 4))
+            row.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(label(if (selected) "●" else "○", 19f, if (selected) accent else mutedColor, true))
+            list.addView(row, marginParams(-1, -2, top = 6))
+        }
+        pickerConnect?.isEnabled = selectedDeviceAddress != null && scanDevices.containsKey(selectedDeviceAddress)
+        pickerStatus?.let { status ->
+            if (connection == Connection.SCANNING) status.text = "Memindai… ${scanDevices.size} perangkat cocok ditemukan"
+        }
     }
 
     private fun connectToDevice(device: BluetoothDevice) {
@@ -512,6 +713,10 @@ class MainActivity : Activity() {
                     connection = Connection.IDLE
                     deviceName = ""
                     reading = false
+                    snapshot = null
+                    voltageHistory.clear()
+                    commandStates.keys.forEach { commandStates[it] = null }
+                    updateData(null)
                     renderConnection()
                     if (status != BluetoothGatt.GATT_SUCCESS) setError("Koneksi ke baterai terputus (status $status).")
                 }
@@ -759,73 +964,25 @@ class MainActivity : Activity() {
         if (connection != Connection.CONNECTED) { toast("Hubungkan baterai terlebih dahulu"); return }
         addLog("Kirim $label: ${BmsProtocol.toHex(bytes)}")
         enqueue(GattOperation(OpKind.WRITE, BmsProtocol.COMMAND_UUID, bytes) { success, _ ->
-            if (success) addLog("BLE menerima $label (status fisik belum diverifikasi)")
+            if (success) {
+                addLog("BLE menerima $label (status fisik belum diverifikasi)")
+                commandStatus.text = "$label diterima BLE; keadaan fisik baterai belum dibaca balik."
+            } else {
+                commandStatus.text = "Penulisan BLE $label gagal; keadaan fisik baterai tidak diketahui."
+            }
             after?.invoke(success)
         })
     }
 
-    private fun confirmPowerAction(title: String, message: String, action: () -> Unit) {
+    private fun confirmPowerAction(title: String, message: String, bytes: ByteArray? = null, action: () -> Unit) {
         if (connection != Connection.CONNECTED) { toast("Hubungkan baterai terlebih dahulu"); return }
+        val exactMessage = if (bytes == null) message else "$message\n\nPayload BLE: ${BmsProtocol.toHex(bytes)}\nHasil tulis BLE tidak mengonfirmasi keadaan fisik baterai."
         AlertDialog.Builder(this)
             .setTitle(title)
-            .setMessage(message)
+            .setMessage(exactMessage)
             .setNegativeButton("Batal", null)
             .setPositiveButton("Lanjutkan") { _, _ -> action() }
             .show()
-    }
-
-    private fun performPowerSequence(on: Boolean) {
-        val label = if (on) "Nyalakan baterai" else "Matikan baterai"
-        addLog("Handshake ulang 0x8901 sebelum $label")
-        val authAvailable = gatt?.getService(UUID.fromString(BmsProtocol.SERVICE_UUID))
-            ?.getCharacteristic(UUID.fromString(BmsProtocol.AUTH_UUID)) != null
-        val startCommands = {
-            tryPowerCommand(label, if (on) BmsProtocol.powerOnCommands() else BmsProtocol.powerOffCommands(), 0)
-        }
-        if (authAvailable) enqueueHandshake(startCommands) else {
-            addLog("Auth 0x8901 tidak ditemukan; lanjut tanpa handshake")
-            startCommands()
-        }
-    }
-
-    private fun tryPowerCommand(label: String, commands: List<ByteArray>, index: Int) {
-        if (index >= commands.size) {
-            setError("Tidak ada opcode $label yang diterima oleh karakteristik 0x8910.")
-            return
-        }
-        if (index > 0) addLog("Tulis gagal; mencoba opcode alternatif ${index + 1}/${commands.size}")
-        val bytes = commands[index]
-        addLog("Kirim $label: ${BmsProtocol.toHex(bytes)}")
-        enqueue(GattOperation(OpKind.WRITE, BmsProtocol.COMMAND_UUID, bytes) { success, _ ->
-            if (success) {
-                addLog("Perintah $label diterima oleh BLE; keadaan fisik belum diverifikasi")
-                commandStatus.text = "Perintah $label dikirim (${BmsProtocol.toHex(bytes)}); status baterai belum dibaca balik."
-            } else {
-                handler.postDelayed({ tryPowerCommand(label, commands, index + 1) }, 700)
-            }
-        })
-    }
-
-    private fun cutAllOutputs() {
-        addLog("Handshake ulang 0x8901 sebelum memutus keluaran")
-        val authAvailable = gatt?.getService(UUID.fromString(BmsProtocol.SERVICE_UUID))
-            ?.getCharacteristic(UUID.fromString(BmsProtocol.AUTH_UUID)) != null
-        val sendDischargeOff = {
-            val bytes = BmsProtocol.dischargeMos(false)
-            addLog("Kirim MOS pengosongan OFF: ${BmsProtocol.toHex(bytes)}")
-            enqueue(GattOperation(OpKind.WRITE, BmsProtocol.COMMAND_UUID, bytes) { success, _ ->
-                if (!success) {
-                    val charge = BmsProtocol.chargeMos(false)
-                    addLog("MOS pengosongan gagal; kirim MOS pengisian OFF: ${BmsProtocol.toHex(charge)}")
-                    enqueue(GattOperation(OpKind.WRITE, BmsProtocol.COMMAND_UUID, charge) { chargeOk, _ ->
-                        if (chargeOk) commandStatus.text = "MOS pengisian OFF dikirim; keadaan aktual belum diverifikasi."
-                    })
-                } else commandStatus.text = "MOS pengosongan OFF dikirim; keadaan aktual belum diverifikasi."
-                if (success) commandStates["discharge"] = false
-                updateSwitches()
-            })
-        }
-        if (authAvailable) enqueueHandshake(sendDischargeOff) else sendDischargeOff()
     }
 
     private fun scanGattServices() {
@@ -855,6 +1012,7 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun disconnectFromBms() {
         stopScan()
+        pickerDialog?.dismiss()
         closeGattQueue()
         try { gatt?.disconnect() } catch (_: Exception) { }
         try { gatt?.close() } catch (_: Exception) { }
@@ -862,6 +1020,7 @@ class MainActivity : Activity() {
         connection = Connection.IDLE
         deviceName = ""
         snapshot = null
+        voltageHistory.clear()
         commandStates.keys.forEach { commandStates[it] = null }
         commandStatus.text = "Status sakelar belum dikonfirmasi oleh BMS."
         updateData(null)
@@ -920,7 +1079,8 @@ class MainActivity : Activity() {
     private fun updateData(data: BmsProtocol.Snapshot?) {
         val status = data?.status
         if (status == null) {
-            gauge.percent = 0
+            batteryBar.percent = 0
+            socValue.text = "—%"
             heroVoltage.text = "0.00 V"
             heroCurrent.text = "0.00 A"
             heroState.text = "—"
@@ -930,26 +1090,35 @@ class MainActivity : Activity() {
             statValues["full"]?.text = "— Ah"
             statValues["minTemp"]?.text = "— °C"
             statValues["maxTemp"]?.text = "— °C"
-            cellSummary.text = "▲ sel tertinggi · ▼ sel terendah · ! >100 mV dari rata-rata"
+            statValues["speed"]?.text = "—"
+            statValues["bmsStatus"]?.text = "—"
+            updateCellSummary(emptyList())
             cellList.removeAllViews()
             cellList.addView(label("Belum ada data sel.", 13f, mutedColor, false))
             temperatureRow.removeAllViews()
             temperatureRow.addView(label("Belum ada data suhu.", 13f, mutedColor, false))
             alarmSummary.text = if (connection == Connection.CONNECTED) "Tidak ada alarm aktif." else "Hubungkan baterai untuk melihat alarm."
             alarmList.removeAllViews()
+            chartView.updateReadings(voltageHistory.toList())
             return
         }
         val soc = status.soc.coerceIn(0, 100)
-        gauge.percent = soc
+        batteryBar.percent = soc
+        socValue.text = "$soc%"
         heroVoltage.text = String.format(Locale.US, "%.2f V", status.voltage)
         heroCurrent.text = String.format(Locale.US, "%.2f A", status.current)
         heroState.text = status.state
         statValues["soh"]?.text = "${status.soh}%"
         statValues["cells"]?.text = "${data.cellsVolts.size}"
-        statValues["remaining"]?.text = status.remainingAh?.let { String.format(Locale.US, "%.2f Ah", it) } ?: "— Ah"
-        statValues["full"]?.text = status.fullAh?.let { String.format(Locale.US, "%.2f Ah", it) } ?: "— Ah"
+        statValues["remaining"]?.text = "— Ah"
+        statValues["full"]?.text = "— Ah"
         statValues["minTemp"]?.text = "${status.minCellTemp} °C"
         statValues["maxTemp"]?.text = "${status.maxCellTemp} °C"
+        statValues["speed"]?.text = "${status.speed}"
+        statValues["bmsStatus"]?.text = String.format(Locale.US, "0x%02X", status.bmsStatus)
+        voltageHistory.addLast(ChartReading(System.currentTimeMillis(), status.voltage))
+        while (voltageHistory.size > 2_000) voltageHistory.removeFirst()
+        chartView.updateReadings(voltageHistory.toList())
         updateCells(data.cellsVolts)
         updateTemperatures(status.temperature, status.minCellTemp, status.maxCellTemp)
         updateAlarms(data.alarms)
@@ -958,13 +1127,14 @@ class MainActivity : Activity() {
     private fun updateCells(cells: List<Double>) {
         cellList.removeAllViews()
         if (cells.isEmpty()) {
+            updateCellSummary(emptyList())
             cellList.addView(label("Belum ada data sel.", 13f, mutedColor, false))
             return
         }
         val average = cells.average()
         val highest = cells.indices.maxByOrNull { cells[it] } ?: -1
         val lowest = cells.indices.minByOrNull { cells[it] } ?: -1
-        cellSummary.text = "Rata-rata ${String.format(Locale.US, "%.3f V", average)} · ▲ tertinggi · ▼ terendah · ! deviasi >100 mV"
+        updateCellSummary(cells)
         cells.forEachIndexed { index, value ->
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
             val marker = when (index) { highest -> "▲"; lowest -> "▼"; else -> "" }
@@ -983,6 +1153,32 @@ class MainActivity : Activity() {
             row.addView(volts, LinearLayout.LayoutParams(dp(78), -2))
             cellList.addView(row, marginParams(-1, dp(28), top = if (index == 0) 1 else 5))
             if (index < cells.lastIndex) cellList.addView(divider(), marginParams(-1, 1, top = 3, bottom = 2))
+        }
+    }
+
+    private fun updateCellSummary(cells: List<Double>) {
+        cellSummary.removeAllViews()
+        if (cells.isEmpty()) {
+            cellSummary.addView(label("Tegangan sel tertinggi/terendah dan selisih akan tampil setelah pembacaan.", 10f, mutedColor, false))
+            return
+        }
+        val highIndex = cells.indices.maxByOrNull { cells[it] } ?: return
+        val lowIndex = cells.indices.minByOrNull { cells[it] } ?: return
+        val delta = cells[highIndex] - cells[lowIndex]
+        val summaries = listOf(
+            Triple("Terendah", "Sel ${lowIndex + 1} · ${String.format(Locale.US, "%.3f V", cells[lowIndex])}", 0xFF71E4D2.toInt()),
+            Triple("Tertinggi", "Sel ${highIndex + 1} · ${String.format(Locale.US, "%.3f V", cells[highIndex])}", 0xFFC6FF94.toInt()),
+            Triple("Voltage (V)", String.format(Locale.US, "%.3f V", delta), textColor)
+        )
+        summaries.forEachIndexed { index, item ->
+            val chip = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                background = rounded(cardSoft, borderColor, 11)
+                addView(label(item.first, 9f, mutedColor, true))
+                addView(label(item.second, 9f, item.third, true).apply { typeface = Typeface.MONOSPACE }, marginParams(-1, -2, top = 5))
+            }
+            cellSummary.addView(chip, LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = dp(6) })
         }
     }
 
@@ -1081,26 +1277,305 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
 
-    private class SocGauge(context: android.content.Context, private val accent: Int, private val muted: Int) : View(context) {
+    private class WaveBatteryBar(context: android.content.Context, private val accent: Int) : View(context) {
         var percent: Int = 0
-            set(value) { field = value.coerceIn(0, 100); invalidate() }
-        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = context.resources.displayMetrics.density * 10f; color = 0xFF263548.toInt() }
-        private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = context.resources.displayMetrics.density * 10f; color = accent }
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFEAF1F7.toInt(); textAlign = Paint.Align.CENTER; typeface = Typeface.create("sans-serif-medium", Typeface.BOLD) }
-        private val captionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = muted; textAlign = Paint.Align.CENTER; textSize = 11f * context.resources.displayMetrics.density; typeface = Typeface.create("sans-serif", Typeface.NORMAL) }
+            set(value) {
+                val target = value.coerceIn(0, 100)
+                if (field == target) return
+                field = target
+                fillAnimator?.cancel()
+                fillAnimator = ValueAnimator.ofInt(displayPercent, target).apply {
+                    duration = 650
+                    interpolator = DecelerateInterpolator()
+                    addUpdateListener { displayPercent = it.animatedValue as Int; invalidate() }
+                    start()
+                }
+            }
+        private var displayPercent = 0
+        private var fillAnimator: ValueAnimator? = null
+        private val density = context.resources.displayMetrics.density
+        private var phase = 0f
+        private val waveAnimator = ValueAnimator.ofFloat(0f, (Math.PI * 2).toFloat()).apply {
+            duration = 2_400
+            repeatCount = ValueAnimator.INFINITE
+            addUpdateListener { phase = it.animatedValue as Float; invalidate() }
+        }
+        private val shellPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2f * density; color = 0xFF6D8270.toInt() }
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF26312D.toInt() }
+        private val liquidPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val waveLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 1.4f * density; color = 0xFFDFFFCB.toInt(); alpha = 190 }
+        private val seamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x55101613 }
+        private val wavePath = Path()
+        private val innerRect = RectF()
+        private val innerPath = Path()
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            if (!waveAnimator.isStarted) waveAnimator.start()
+        }
+
+        override fun onDetachedFromWindow() {
+            waveAnimator.cancel()
+            super.onDetachedFromWindow()
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val density = resources.displayMetrics.density
-            val stroke = trackPaint.strokeWidth
-            val side = minOf(width, height).toFloat()
-            val inset = stroke / 2 + 5 * density
-            val bounds = RectF((width - side) / 2 + inset, (height - side) / 2 + inset, (width + side) / 2 - inset, (height + side) / 2 - inset)
-            canvas.drawArc(bounds, 135f, 270f, false, trackPaint)
-            canvas.drawArc(bounds, 135f, 270f * percent / 100f, false, valuePaint)
-            textPaint.textSize = 29f * density
-            val centerY = height / 2f - 1f * density
-            canvas.drawText("$percent%", width / 2f, centerY, textPaint)
-            canvas.drawText("SOC", width / 2f, centerY + 22f * density, captionPaint)
+            val shellLeft = 2f * density
+            val shellTop = 5f * density
+            val terminalWidth = 6f * density
+            val shellRight = width - terminalWidth - 3f * density
+            val shellBottom = height - 5f * density
+            val shell = RectF(shellLeft, shellTop, shellRight, shellBottom)
+            val inset = 5f * density
+            innerRect.set(shell.left + inset, shell.top + inset, shell.right - inset, shell.bottom - inset)
+            canvas.drawRoundRect(shell, 10f * density, 10f * density, shellPaint)
+            innerPath.reset()
+            innerPath.addRoundRect(innerRect, 5f * density, 5f * density, Path.Direction.CW)
+            canvas.drawPath(innerPath, trackPaint)
+            val fillRight = innerRect.left + innerRect.width() * displayPercent / 100f
+            if (displayPercent > 0) {
+                val save = canvas.save()
+                canvas.clipPath(innerPath)
+                canvas.clipRect(innerRect.left, innerRect.top, fillRight, innerRect.bottom)
+                val gradient = LinearGradient(innerRect.left, 0f, innerRect.right, 0f, 0xFF55CDB3.toInt(), 0xFFA6F279.toInt(), Shader.TileMode.CLAMP)
+                liquidPaint.shader = gradient
+                val averageY = innerRect.bottom - innerRect.height() * 0.57f
+                val amplitude = innerRect.height() * 0.13f
+                wavePath.reset()
+                wavePath.moveTo(innerRect.left, innerRect.bottom)
+                wavePath.lineTo(innerRect.left, averageY)
+                val steps = maxOf(18, (innerRect.width() / (3f * density)).toInt())
+                for (step in 1..steps) {
+                    val x = innerRect.left + innerRect.width() * step / steps
+                    val y = averageY + kotlin.math.sin((x / (innerRect.width() * 0.34f)) - phase).toFloat() * amplitude
+                    wavePath.lineTo(x, y)
+                }
+                wavePath.lineTo(innerRect.right, innerRect.bottom)
+                wavePath.close()
+                canvas.drawPath(wavePath, liquidPaint)
+                wavePath.reset()
+                for (step in 0..steps) {
+                    val x = innerRect.left + innerRect.width() * step / steps
+                    val y = averageY + kotlin.math.sin((x / (innerRect.width() * 0.34f)) - phase).toFloat() * amplitude
+                    if (step == 0) wavePath.moveTo(x, y) else wavePath.lineTo(x, y)
+                }
+                canvas.drawPath(wavePath, waveLinePaint)
+                for (seam in 1..9) {
+                    val x = innerRect.left + innerRect.width() * seam / 10f
+                    canvas.drawLine(x, innerRect.top, x, innerRect.bottom, seamPaint)
+                }
+                canvas.restoreToCount(save)
+            }
+            val terminal = RectF(shell.right + 1f * density, height / 2f - 8f * density, shell.right + terminalWidth, height / 2f + 8f * density)
+            liquidPaint.shader = null
+            liquidPaint.color = accent
+            canvas.drawRoundRect(terminal, 3f * density, 3f * density, liquidPaint)
+        }
+    }
+
+    private class VoltageChartView(
+        context: android.content.Context,
+        private val accent: Int,
+        private val muted: Int,
+        private val onSelection: (ChartReading?) -> Unit
+    ) : View(context) {
+        private val density = context.resources.displayMetrics.density
+        private var readings: List<ChartReading> = emptyList()
+        private var visible: List<ChartReading> = emptyList()
+        private var rangeHours = 24
+        private var selectedIndex = -1
+        private var followLatest = true
+        private var dragging = false
+        private var animationProgress = 1f
+        private var shapeFrom = FloatArray(0)
+        private var shapeTo = FloatArray(0)
+        private var rangeAnimator: ValueAnimator? = null
+        private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF293638.toInt(); strokeWidth = 1f * density }
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent; strokeWidth = 2.2f * density; style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+        private val areaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent; alpha = 32 }
+        private val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFD8FFB2.toInt(); style = Paint.Style.FILL }
+        private val markerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent; style = Paint.Style.STROKE; strokeWidth = 2f * density }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = muted; textSize = 9f * density; typeface = Typeface.MONOSPACE }
+        private val path = Path()
+        private val area = Path()
+
+        init {
+            isClickable = true
+            contentDescription = "Voltage history. Drag across the chart to inspect session readings."
+        }
+
+        fun sampleCount(): Int = visible.size
+
+        fun updateReadings(values: List<ChartReading>) {
+            val oldSelectedTime = visible.getOrNull(selectedIndex)?.atMillis
+            readings = values
+            visible = filteredReadings()
+            selectedIndex = if (followLatest) visible.lastIndex else oldSelectedTime?.let { oldTime ->
+                visible.indices.minByOrNull { kotlin.math.abs(visible[it].atMillis - oldTime) } ?: visible.lastIndex
+            } ?: visible.lastIndex
+            shapeTo = normalizedShape(visible)
+            shapeFrom = shapeTo.copyOf()
+            animationProgress = 1f
+            notifySelection()
+            invalidate()
+        }
+
+        fun setRangeHours(hours: Int) {
+            if (rangeHours == hours) return
+            val oldShape = if (shapeTo.isEmpty()) normalizedShape(visible) else currentShape()
+            rangeHours = hours
+            visible = filteredReadings()
+            selectedIndex = visible.lastIndex
+            followLatest = true
+            shapeFrom = oldShape
+            shapeTo = normalizedShape(visible)
+            rangeAnimator?.cancel()
+            if (shapeFrom.isEmpty() || shapeTo.isEmpty()) {
+                shapeFrom = shapeTo.copyOf()
+                animationProgress = 1f
+            } else {
+                animationProgress = 0f
+                rangeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 480
+                    interpolator = DecelerateInterpolator()
+                    addUpdateListener { animationProgress = it.animatedValue as Float; invalidate() }
+                    start()
+                }
+            }
+            notifySelection()
+            invalidate()
+        }
+
+        private fun filteredReadings(): List<ChartReading> {
+            val cutoff = System.currentTimeMillis() - rangeHours * 60L * 60L * 1_000L
+            return readings.filter { it.atMillis >= cutoff }
+        }
+
+        private fun currentShape(): FloatArray {
+            if (shapeFrom.isEmpty() || shapeTo.isEmpty()) return shapeTo
+            return FloatArray(shapeTo.size) { index ->
+                val start = shapeFrom.getOrElse(index) { shapeTo[index] }
+                start + (shapeTo[index] - start) * animationProgress
+            }
+        }
+
+        private fun normalizedShape(points: List<ChartReading>): FloatArray {
+            val count = 48
+            if (points.isEmpty()) return FloatArray(0)
+            val minimum = points.minOf { it.volts }
+            val maximum = points.maxOf { it.volts }
+            val padding = maxOf((maximum - minimum) * 0.12, 0.02)
+            val low = minimum - padding
+            val span = (maximum - minimum) + padding * 2.0
+            return FloatArray(count) { index ->
+                val position = if (count == 1) 0.0 else index.toDouble() / (count - 1) * (points.size - 1)
+                val left = position.toInt().coerceIn(0, points.lastIndex)
+                val right = (left + 1).coerceAtMost(points.lastIndex)
+                val fraction = position - left
+                val value = points[left].volts + (points[right].volts - points[left].volts) * fraction
+                ((value - low) / span).toFloat().coerceIn(0f, 1f)
+            }
+        }
+
+        private fun notifySelection() {
+            val selected = visible.getOrNull(selectedIndex)
+            onSelection(selected)
+            selected?.let { contentDescription = "${String.format(Locale.US, "%.2f", it.volts)} volts at ${SimpleDateFormat("dd/MM HH:mm:ss", Locale.US).format(Date(it.atMillis))}. Drag to inspect other readings." }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val left = 8f * density
+            val right = width - 8f * density
+            val top = 8f * density
+            val bottom = height - 22f * density
+            if (right <= left || bottom <= top) return
+            for (row in 0..2) {
+                val y = top + (bottom - top) * row / 2f
+                canvas.drawLine(left, y, right, y, gridPaint)
+            }
+            if (visible.isEmpty()) {
+                textPaint.textSize = 10f * density
+                canvas.drawText("Belum ada bacaan tegangan", left, (top + bottom) / 2f, textPaint)
+                return
+            }
+            val interpolatedShape = currentShape()
+            val shape = if (interpolatedShape.isEmpty()) normalizedShape(visible) else interpolatedShape
+            path.reset()
+            for (index in shape.indices) {
+                val x = left + (right - left) * index / (shape.size - 1).coerceAtLeast(1)
+                val y = bottom - (bottom - top) * shape[index]
+                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            area.set(path)
+            area.lineTo(right, bottom)
+            area.lineTo(left, bottom)
+            area.close()
+            canvas.drawPath(area, areaPaint)
+            canvas.drawPath(path, linePaint)
+            val chosen = visible.getOrNull(selectedIndex)
+            if (chosen != null) {
+                val x = if (visible.size <= 1) right else left + (right - left) * selectedIndex / (visible.size - 1)
+                val minimum = visible.minOf { it.volts }
+                val maximum = visible.maxOf { it.volts }
+                val padding = maxOf((maximum - minimum) * 0.12, 0.02)
+                val yNorm = ((chosen.volts - (minimum - padding)) / ((maximum - minimum) + padding * 2.0)).toFloat().coerceIn(0f, 1f)
+                val y = bottom - (bottom - top) * yNorm
+                canvas.drawLine(x, top, x, bottom, markerRingPaint)
+                canvas.drawCircle(x, y, 4f * density, markerPaint)
+                canvas.drawCircle(x, y, 4f * density, markerRingPaint)
+            }
+            textPaint.textSize = 8f * density
+            val start = SimpleDateFormat("HH:mm", Locale.US).format(Date(visible.first().atMillis))
+            val end = SimpleDateFormat("HH:mm", Locale.US).format(Date(visible.last().atMillis))
+            canvas.drawText(start, left, height - 4f * density, textPaint)
+            val endWidth = textPaint.measureText(end)
+            canvas.drawText(end, right - endWidth, height - 4f * density, textPaint)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (visible.isEmpty()) return false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragging = true
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    selectAt(event.x)
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (dragging) selectAt(event.x)
+                    return dragging
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (dragging) selectAt(event.x)
+                    dragging = false
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    performClick()
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    dragging = false
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    return true
+                }
+            }
+            return true
+        }
+
+        private fun selectAt(x: Float) {
+            val left = 8f * density
+            val right = width - 8f * density
+            val fraction = ((x - left) / (right - left).coerceAtLeast(1f)).coerceIn(0f, 1f)
+            selectedIndex = (fraction * (visible.size - 1)).toInt().coerceIn(0, visible.lastIndex)
+            followLatest = selectedIndex == visible.lastIndex
+            notifySelection()
+            invalidate()
+        }
+
+        override fun performClick(): Boolean {
+            super.performClick()
+            return true
         }
     }
 
