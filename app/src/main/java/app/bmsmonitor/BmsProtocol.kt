@@ -41,30 +41,30 @@ object BmsProtocol {
         val alarms: List<Alarm>
     )
 
-    private val states = listOf("Bergerak", "Diam", "Penyimpanan", "Tidur", "Tidur dalam")
+    private val states = listOf("Moving", "Stationary", "Storage", "Sleep", "Deep sleep")
     private data class BitAlarm(val byte: Int, val bit: Int, val label: String)
     private val alarmsA = listOf(
-        BitAlarm(1, 2, "Arus pengisian berlebih"),
-        BitAlarm(1, 3, "Arus pengosongan berlebih"),
-        BitAlarm(1, 4, "Hubung singkat"),
-        BitAlarm(1, 5, "Suhu pengisian tinggi"),
-        BitAlarm(1, 6, "Suhu pengosongan tinggi"),
-        BitAlarm(1, 7, "Suhu pengisian rendah"),
-        BitAlarm(2, 0, "Suhu pengosongan rendah"),
-        BitAlarm(2, 1, "MOS pengisian rusak"),
-        BitAlarm(2, 2, "MOS pengosongan rusak"),
-        BitAlarm(2, 3, "Kesalahan komunikasi internal")
+        BitAlarm(1, 2, "Overcharge current"),
+        BitAlarm(1, 3, "Over-discharge current"),
+        BitAlarm(1, 4, "Short circuit"),
+        BitAlarm(1, 5, "High charging temperature"),
+        BitAlarm(1, 6, "High discharging temperature"),
+        BitAlarm(1, 7, "Low charging temperature"),
+        BitAlarm(2, 0, "Low discharging temperature"),
+        BitAlarm(2, 1, "Charge MOS fault"),
+        BitAlarm(2, 2, "Discharge MOS fault"),
+        BitAlarm(2, 3, "Internal communication error")
     )
     private val alarmsB = listOf(
-        BitAlarm(5, 0, "Selisih tegangan sel besar"),
-        BitAlarm(5, 1, "Tegangan total berlebih"),
-        BitAlarm(5, 2, "Tegangan total rendah"),
-        BitAlarm(5, 3, "Suhu sangat tinggi"),
-        BitAlarm(5, 4, "Suhu MOS tinggi"),
-        BitAlarm(5, 5, "Suhu lingkungan rendah"),
-        BitAlarm(5, 6, "Suhu lingkungan tinggi"),
-        BitAlarm(5, 7, "Kegagalan sel"),
-        BitAlarm(6, 3, "Baterai terlepas")
+        BitAlarm(5, 0, "Large cell-voltage difference"),
+        BitAlarm(5, 1, "Total voltage too high"),
+        BitAlarm(5, 2, "Total voltage too low"),
+        BitAlarm(5, 3, "Very high temperature"),
+        BitAlarm(5, 4, "High MOS temperature"),
+        BitAlarm(5, 5, "Low ambient temperature"),
+        BitAlarm(5, 6, "High ambient temperature"),
+        BitAlarm(5, 7, "Cell failure"),
+        BitAlarm(6, 3, "Battery disconnected")
     )
 
     /** Only bytes 0–15 are mapped by the recovered status decoder; leave trailing bytes uninterpreted. */
@@ -72,7 +72,7 @@ object BmsProtocol {
         if (bytes == null || bytes.size < 16) return null
         val stateIndex = u8(bytes[0])
         return Status(
-            state = states.getOrNull(stateIndex) ?: "Tidak diketahui",
+            state = states.getOrNull(stateIndex) ?: "Unknown",
             voltage = u16be(bytes, 1) / 100.0,
             current = s16be(bytes, 3) / 100.0,
             soc = u8(bytes[5]),
@@ -107,7 +107,7 @@ object BmsProtocol {
         addSetBits(found, faultA, alarmsA)
         addSetBits(found, faultB, alarmsB)
         if (status?.hasFault == true && found.isEmpty()) {
-            found += Alarm("bms", "BMS melaporkan gangguan; detail tidak tersedia")
+            found += Alarm("bms", "The BMS reports a fault; details are unavailable.")
         }
         return found
     }

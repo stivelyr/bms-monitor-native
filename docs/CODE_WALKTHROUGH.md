@@ -34,18 +34,18 @@ flowchart TD
 | `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties` | Gradle plugins/repositories, project identity, and build settings. |
 | `gradle/wrapper/` | Gradle 8.7 wrapper configuration and wrapper JAR/script. |
 
-The view hierarchy is built programmatically; there are no XML layout files. UI labels are currently hard-coded in Indonesian. The app has no runtime library dependencies beyond the Android platform; JUnit is test-only.
+The view hierarchy is built programmatically; there are no XML layout files. UI labels are in English, and the four bottom-navigation sections are Overview, Cells, Alarms, and Controls. The disconnected dashboard uses placeholders rather than fabricated readings. The app has no runtime library dependencies beyond the Android platform; JUnit is test-only.
 
 ## Startup and BLE connection
 
 1. `onCreate()` obtains the Android Bluetooth adapter, builds the screen, initializes the disconnected UI, and renders empty data.
-2. **Hubungkan** calls `onConnectPressed()`. The app checks for a BLE adapter, the relevant Android-version permissions, and Bluetooth being enabled.
+2. **Connect** calls `onConnectPressed()`. The app checks for a BLE adapter, the relevant Android-version permissions, and Bluetooth being enabled.
 3. `beginScan()` starts a scan for up to eight seconds. `collectScanResult()` accepts a name beginning with `BTD` (case-insensitive) or a device advertising the expected `0x8900` service. Results are de-duplicated by Bluetooth address and shown live in a picker with actual signal strength; the user selects a result before connecting.
 4. `connectToDevice()` opens a LE GATT connection. On success the callback enters service discovery.
 5. `onServicesDiscovered()` requires the `0x8900` service. If it is absent, the app reports incompatibility and disconnects.
 6. `enableAuthAndStart()` attempts to enable notifications on `0x8901` and write its optional Client Characteristic Configuration Descriptor, then queues the fixed 17-byte all-`FF` handshake. If auth or notification support is absent, it logs the condition and continues to reads. A failed handshake write also does not block monitoring.
 7. `beginReadCycle()` queues reads for status, three cell blocks, and two fault blocks. Once they complete, the app assembles a `Snapshot`, updates the UI, and schedules the next cycle about 1.5 seconds later.
-8. `onDestroy()` stops scanning, cancels scheduled callbacks, and disconnects/closes GATT. The explicit **Putus** button also clears queued work and resets displayed/command state.
+8. `onDestroy()` stops scanning, cancels scheduled callbacks, and disconnects/closes GATT. The explicit **Disconnect** button also clears queued work and resets displayed/command state.
 
 ## Why there is a GATT queue
 
@@ -79,15 +79,15 @@ Detailed byte offsets, UUIDs, alarm bits, and exact command bytes are in the [BL
 
 ## Screen and controls (`MainActivity.kt`)
 
-`buildUi()` creates the scrollable dashboard and cards for:
+`buildUi()` creates a four-tab dashboard using the mockup's dark green/charcoal palette, rounded cards, restrained lime accents, and fixed bottom navigation. It creates cards for:
 
 - Connection status, connect/refresh/disconnect actions, and an error panel.
 - Animated horizontal wave battery bar for SOC, pack voltage/current, and operating state.
-- A voltage history graph built from real readings collected in the current session. Dragging selects a sample for inspection; 24-hour, 7-day, and 30-day controls animate between filtered views without inventing history or writing it to storage.
+- A voltage history graph built from real readings collected in the current session. Dragging moves the inspection marker smoothly while the readout identifies the nearest real sample; 24-hour, 7-day, and 30-day controls animate the plotted shape between filtered views without inventing history or writing it to storage.
 - SOH, cell count, temperatures, raw speed and raw BMS-status bytes, and explicit unavailable capacity placeholders.
 - Per-cell voltage bars, highest/lowest values, the high-to-low difference labeled `Voltage (V)`, and a visual warning for a cell more than 100 mV from the pack average. This is a display heuristic, not a BMS alarm threshold.
 - Charge MOS, discharge MOS, buzzer, battery on/off, and sleep actions using only the direct command payloads listed in the protocol reference.
-- GATT diagnostic inspection, decoded protection alarms, and a maximum-30-entry in-memory operation log.
+- GATT diagnostic inspection, decoded protection alarms, a maximum-30-entry in-memory activity log, and a separate command log showing exact payloads and BLE write outcomes.
 
 The control methods check that a BMS is connected. Each fixed command is routed through `confirmPowerAction()` so the user sees the exact payload and must explicitly continue. Power on/off sends one `SetPowerSwitch` payload; no fallback opcodes are attempted after a failed write.
 

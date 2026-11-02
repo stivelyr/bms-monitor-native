@@ -29,7 +29,7 @@ class BmsProtocolTest {
         packet[19] = 0x0B
 
         val status = BmsProtocol.parseStatus(packet)!!
-        assertEquals("Diam", status.state)
+        assertEquals("Stationary", status.state)
         assertEquals(51.23, status.voltage, 0.0001)
         assertEquals(-1.5, status.current, 0.0001)
         assertEquals(73, status.soc)
@@ -68,7 +68,7 @@ class BmsProtocolTest {
     @Test fun mapsFaultBitsAndReportsUnspecifiedBmsFault() {
         val faultA = ByteArray(3)
         faultA[1] = (1 shl 4).toByte()
-        assertEquals("Hubung singkat", BmsProtocol.parseAlarms(faultA, null).single().label)
+        assertEquals("Short circuit", BmsProtocol.parseAlarms(faultA, null).single().label)
 
         val status = BmsProtocol.parseStatus(ByteArray(16).also { it[15] = 1 })!!
         val fallback = BmsProtocol.parseAlarms(null, null, status)

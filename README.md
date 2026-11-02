@@ -10,12 +10,12 @@ Compatibility depends on the battery BMS exposing the BLE service and packet/com
 - Connects to the vendor service `00008900-0000-1000-8000-00805f9b34fb`. If the authentication characteristic is present, it subscribes to its notifications where possible and sends a 17-byte all-`FF` handshake.
 - Reads status, cell-voltage blocks, and two alarm/fault blocks through a serialized GATT queue. The app refreshes automatically about every 1.5 seconds while connected.
 - Displays state of charge (SOC), pack voltage and current, state of health (SOH), cell count and voltages, three temperatures, decoded alarms, plus raw speed and BMS-status bytes whose units/meanings are not verified.
-- Shows SOC in an animated horizontal wave battery bar and plots measured pack voltage. Drag across the graph to inspect a reading; 24-hour, 7-day, and 30-day ranges filter only samples collected during the current app session.
+- Shows SOC in an animated horizontal wave battery bar and plots measured pack voltage. Drag across the graph for a smoothly following inspection marker and nearest real-sample readout; 24-hour, 7-day, and 30-day range changes animate between views while filtering only samples collected during the current app session.
 - Shows the highest and lowest cell readings and their difference, labeled `Voltage (V)`.
 - Offers charge-MOS, discharge-MOS, buzzer, sleep, and battery on/off controls using only the direct command payloads recovered from the original app. Every command is user-initiated; a confirmation shows the exact bytes before sending.
-- Shows discovered GATT services and characteristic properties, and keeps a small in-memory list of recent operations for troubleshooting.
+- Shows discovered GATT services and characteristic properties, with a separate in-memory command log that records payloads and BLE write outcomes.
 
-The current screen text is Indonesian. The app uses Android's native UI widgets and custom Canvas views for the battery bar and graph; it does not use a web view or a third-party UI framework.
+The English dashboard follows the mockup's dark green and charcoal visual system, with Overview, Cells, Alarms and Controls tabs. The disconnected screen uses placeholders instead of invented battery readings. The app uses Android's native UI widgets and custom Canvas views for the animated battery bar and graph; it does not use a web view or a third-party UI framework.
 
 ## Important safety and accuracy notes
 
@@ -35,11 +35,11 @@ Read [the protocol reference](docs/PROTOCOL_REFERENCE.md) before changing comman
 ## First-use outline
 
 1. Install the debug APK on a BLE-capable Android device and enable Bluetooth.
-2. Tap **Hubungkan** (Connect). Grant the Bluetooth permissions requested by Android.
+2. Tap **Connect**. Grant the Bluetooth permissions requested by Android.
 3. Keep the target battery powered and within BLE range. The scan lasts about eight seconds and offers matching devices for selection.
 4. Once connected, verify that readings are plausible for the battery. A missing value or unavailable capacity is preferable to treating an unknown field as a measurement.
 5. Treat every control as a real battery command. Read the confirmation text, check attached loads, and proceed only when the outcome is safe.
-6. Use **Pindai GATT** (Scan GATT) to inspect service/characteristic availability if the app cannot connect or read data.
+6. Open **Controls** and use **Scan GATT** to inspect service/characteristic availability if the app cannot connect or read data.
 
 ## Repository layout
 
@@ -72,7 +72,7 @@ Read [the protocol reference](docs/PROTOCOL_REFERENCE.md) before changing comman
 
 ## Data handling
 
-The app communicates directly with the nearby BMS over Bluetooth LE. It has no account, cloud backend, or internet permission. Although the original APK declares battery-life and fault-list server routes, backend access and behavior are unverified, so no such network integration is added here. The visible operation log is held in memory, limited to the latest 30 entries, and is not an uploaded diagnostic archive. BLE captures and uploaded diagnostic logs must remain outside this repository; `.gitignore` excludes common capture/log paths and file extensions.
+The app communicates directly with the nearby BMS over Bluetooth LE. It has no account, cloud backend, or internet permission. Although the original APK declares battery-life and fault-list server routes, backend access and behavior are unverified, so no such network integration is added here. The activity and command logs are held in memory, limited to 30 entries each, and are not uploaded or persisted. BLE captures and uploaded diagnostic logs must remain outside this repository; `.gitignore` excludes common capture/log paths and file extensions.
 
 ## Project status and known gaps
 
